@@ -271,6 +271,7 @@ struct pollfd {
 #include <sys/socket.h>
 #include <sys/poll.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
 #include <sys/utsname.h>
@@ -711,6 +712,7 @@ enum {
     LUA_WEBSOCKET_EXTENSIONS,
 #endif
     ACCESS_CONTROL_ALLOW_ORIGIN, ERROR_PAGES,
+    CONFIG_TCP_NODELAY, /* Prepended CONFIG_ to avoid conflict with the socket option typedef TCP_NODELAY */
 
     NUM_OPTIONS
 };
@@ -761,6 +763,7 @@ static struct mg_option config_options[] = {
 #endif
     {"access_control_allow_origin", CONFIG_TYPE_STRING,        "*"},
     {"error_pages",                 CONFIG_TYPE_DIRECTORY,     NULL},
+    {"tcp_nodelay", CONFIG_TYPE_BOOLEAN, "no"},
 
     {NULL, CONFIG_TYPE_UNKNOWN, NULL}
 };
@@ -6350,6 +6353,23 @@ static void reset_per_request_attributes(struct mg_connection *conn)
     conn->is_chunked = 0;
 }
 
+typedef const char *SOCK_OPT_TYPE;
+
+static int
+set_tcp_nodelay(SOCKET sock, int nodelay_on)
+{
+	if (setsockopt(sock,
+	               IPPROTO_TCP,
+	               TCP_NODELAY,
+	               (SOCK_OPT_TYPE)&nodelay_on,
+	               sizeof(nodelay_on)) != 0) {
+		/* Error */
+		return 1;
+	}
+	/* OK */
+	return 0;
+}
+
 static void close_socket_gracefully(struct mg_connection *conn)
 {
 #if defined(_WIN32)
@@ -6813,7 +6833,25 @@ static void accept_new_connection(const struct socket *listener,
                    "%s: setsockopt(SOL_SOCKET SO_KEEPALIVE) failed: %s",
                    __func__, strerror(ERRNO));
         }
-        set_sock_timeout(so.sock, atoi(ctx->config[REQUEST_TIMEOUT]));
+
+	/* Disable TCP Nagle's algorithm. Normally TCP packets are coalesced
+	 * to effectively fill up the underlying IP packet payload and
+	 * reduce the overhead of sending lots of small buffers. However
+	 * this hurts the server's throughput (ie. operations per second)
+	 * when HTTP 1.1 persistent connections are used and the responses
+	 * are relatively small (eg. less than 1400 bytes).
+	 */
+	if ((ctx != NULL) && (ctx->config[CONFIG_TCP_NODELAY] != NULL)
+		&& (!strcmp(ctx->config[CONFIG_TCP_NODELAY], "1"))) {
+		if (set_tcp_nodelay(so.sock, 1) != 0) {
+			mg_cry(fc(ctx),
+				"%s: setsockopt(IPPROTO_TCP TCP_NODELAY) failed: %s",
+				__func__,
+				strerror(ERRNO));
+		}
+	}
+
+	set_sock_timeout(so.sock, atoi(ctx->config[REQUEST_TIMEOUT]));
         produce_socket(ctx, &so);
     }
 }
